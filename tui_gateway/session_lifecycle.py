@@ -548,6 +548,14 @@ def _attach_worker(sid: str, session: dict, worker) -> None:
 _closed_session_activity: dict[str, float] = {}
 
 
+def _discard_claimed_attachment_bundle(session):
+    """A removed queue head remains cancellable until dispatch starts. Caller holds history_lock."""
+    claim = session.get("_dispatching_queued_prompt")
+    if isinstance(claim, dict) and not claim.get("_attachment_dispatch_started"):
+        if (bundle := claim.get("_attachment_bundle")) is not None:
+            bundle.cleanup()
+
+
 def _pop_session_by_id(sid: str) -> dict | None:
     """Atomically detach one live session from the registry — the ownership claim for teardown (a concurrent
     close/reaper no-ops). Separate from ``_teardown_session``: slow finalization must not run under the resume lock."""
@@ -561,6 +569,14 @@ def _pop_session_by_id(sid: str) -> dict | None:
             _closed_session_activity[home] = max(_closed_session_activity.get(home, 0), last_active)
             session["_closing"] = True
             session["_sid"] = sid  # out of _sessions now, so teardown can't recover the live id by scanning
+    if session is not None:
+        with session.get("history_lock", contextlib.nullcontext()):
+            _discard_claimed_attachment_bundle(session)
+            for envelope in ([session["queued_prompt"]] if session.get("queued_prompt") else []) + list(session.get("queued_prompts") or []):
+                if isinstance(envelope, dict) and (bundle := envelope.get("_attachment_bundle")) is not None:
+                    bundle.cleanup()
+            session["queued_prompt"] = None
+            session.pop("queued_prompts", None)
     return session
 
 
@@ -707,9 +723,16 @@ def _interrupt_session_turn(
         run_thread_alive = (rt := session.get("_run_thread")) is not None and rt.is_alive()
     with session["history_lock"]:
         session["_turn_cancel_requested"] = True
+        _discard_claimed_attachment_bundle(session)
+        cancelled_bundles = [e.get("_attachment_bundle") for e in
+            ([session["queued_prompt"]] if session.get("queued_prompt") else []) + list(session.get("queued_prompts") or [])
+            if isinstance(e, dict)]
         session["queued_prompt"] = None
         session.pop("queued_prompts", None)
         session["_queued_prompt_generation"] = int(session.get("_queued_prompt_generation", 0)) + 1
+    for bundle in cancelled_bundles:
+        if bundle is not None:
+            bundle.cleanup()
     if should_interrupt:
         # Sibling of gateway/run_agent_cache.py::_interrupt_and_clear_session: a user-initiated stop of a
         # live TUI/desktop turn is the same "loop is gone" event for plugins holding per-turn external

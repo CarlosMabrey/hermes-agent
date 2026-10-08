@@ -7,6 +7,8 @@ and voice / wake-word control (``methods_voice.py``).
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import Field
 
 from .base import JsonValue, Params, Result, WireEnum
@@ -23,12 +25,22 @@ class ClientSurface(WireEnum):
     voice_live = "voice-live"
 
 
+class PromptAttachment(Params):
+    """Inline image bytes; filename is a label, never a server path."""
+    kind: Literal["image"]
+    mime_type: Literal["image/png", "image/jpeg", "image/webp"]
+    content_base64: str = Field(max_length=13_981_016)
+    filename: str | None = Field(default=None, max_length=255)
+
+
 class PromptSubmitParams(SessionParams):
     """``text`` is normally a string; the relay / hosted paths may hand a structured (parts list)
     payload, and the busy path renders it. Truncation (rewind / edit / regenerate) needs explicit
     consent: ``confirm_truncate`` plus one durable target (``truncate_before_row_id`` preferred,
     ``truncate_before_message_id``, or the legacy ``truncate_before_user_ordinal``)."""
 
+    attachment_mode: Literal["legacy", "explicit"] = "legacy"
+    attachments: list[PromptAttachment] = Field(default_factory=list, max_length=4)
     text: JsonValue = ""
     display_kind: str | None = None  # only "hidden" is honoured; anything else renders as a user row
     interrupted: bool | None = None  # client-side barge-in: the turn's model message carries the note

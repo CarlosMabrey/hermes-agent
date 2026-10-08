@@ -20,6 +20,7 @@ method("ping", params=PingParams, result=PingResult,
 
 class GatewayCapabilitiesResult(Result):
     per_session_exclusive_submit: bool
+    prompt_explicit_attachments_v1: bool = False
 
 
 method("gateway.capabilities", params=PingParams, result=GatewayCapabilitiesResult,

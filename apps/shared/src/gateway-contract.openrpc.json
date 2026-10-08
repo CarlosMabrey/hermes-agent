@@ -14371,6 +14371,11 @@
           "per_session_exclusive_submit": {
             "title": "Per Session Exclusive Submit",
             "type": "boolean"
+          },
+          "prompt_explicit_attachments_v1": {
+            "default": false,
+            "title": "Prompt Explicit Attachments V1",
+            "type": "boolean"
           }
         },
         "required": [
@@ -26480,6 +26485,51 @@
         "title": "ProjectsUpdateParams",
         "type": "object"
       },
+      "PromptAttachment": {
+        "additionalProperties": false,
+        "description": "Inline image bytes; filename is a label, never a server path.",
+        "properties": {
+          "kind": {
+            "const": "image",
+            "title": "Kind",
+            "type": "string"
+          },
+          "mime_type": {
+            "enum": [
+              "image/png",
+              "image/jpeg",
+              "image/webp"
+            ],
+            "title": "Mime Type",
+            "type": "string"
+          },
+          "content_base64": {
+            "maxLength": 13981016,
+            "title": "Content Base64",
+            "type": "string"
+          },
+          "filename": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Filename"
+          }
+        },
+        "required": [
+          "kind",
+          "mime_type",
+          "content_base64"
+        ],
+        "title": "PromptAttachment",
+        "type": "object"
+      },
       "PromptSubmitParams": {
         "additionalProperties": false,
         "description": "``text`` is normally a string; the relay / hosted paths may hand a structured (parts list)\npayload, and the busy path renders it. Truncation (rewind / edit / regenerate) needs explicit\nconsent: ``confirm_truncate`` plus one durable target (``truncate_before_row_id`` preferred,\n``truncate_before_message_id``, or the legacy ``truncate_before_user_ordinal``).",
@@ -26499,6 +26549,23 @@
             ],
             "default": null,
             "title": "Profile"
+          },
+          "attachment_mode": {
+            "default": "legacy",
+            "enum": [
+              "legacy",
+              "explicit"
+            ],
+            "title": "Attachment Mode",
+            "type": "string"
+          },
+          "attachments": {
+            "items": {
+              "$ref": "#/components/schemas/PromptAttachment"
+            },
+            "maxItems": 4,
+            "title": "Attachments",
+            "type": "array"
           },
           "text": {
             "default": "",

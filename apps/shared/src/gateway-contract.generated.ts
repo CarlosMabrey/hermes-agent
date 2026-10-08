@@ -1896,6 +1896,7 @@ export interface PingResult {
 }
 export interface GatewayCapabilitiesResult {
   per_session_exclusive_submit: boolean
+  prompt_explicit_attachments_v1?: boolean
 }
 export interface ClientCapabilitiesParams {
   server_requests?: boolean
@@ -2681,6 +2682,8 @@ export interface PetScaleResult {
 export interface PromptSubmitParams {
   session_id: string
   profile?: string | null
+  attachment_mode?: 'legacy' | 'explicit'
+  attachments?: PromptAttachment[]
   text?: unknown
   display_kind?: string | null
   interrupted?: boolean | null
@@ -2695,6 +2698,13 @@ export interface PromptSubmitParams {
   confirm_truncate?: boolean | null
   confirm_empty_truncate?: boolean | null
   rebind_survivor_row_ids?: number[] | null
+}
+/** Inline image bytes; filename is a label, never a server path. */
+export interface PromptAttachment {
+  kind: 'image'
+  mime_type: 'image/png' | 'image/jpeg' | 'image/webp'
+  content_base64: string
+  filename?: string | null
 }
 /** ``status`` is absent only on the typed-stop-phrase reply (``voice_stopped``). After a truncation the survivor row ids let the client rebind its cached ``rowId``s (``None`` map entries: drop the cached id). ``turn_isolation`` marks a compute-host dispatch. */
 export interface PromptSubmitResult {

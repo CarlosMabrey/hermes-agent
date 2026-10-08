@@ -436,7 +436,9 @@ def _(rid, params: dict) -> dict:
     """What THIS BUILD enforces (a client withholds unless advertised), sourced from the enforcing
     module, never config: a believed-but-absent capability is worse."""
     from hermes_cli.active_sessions import PER_SESSION_EXCLUSIVE_SUBMIT
-    return _ok(rid, {"per_session_exclusive_submit": bool(PER_SESSION_EXCLUSIVE_SUBMIT)})
+    from tui_gateway.explicit_attachments import PROMPT_EXPLICIT_ATTACHMENTS_V1
+    return _ok(rid, {"per_session_exclusive_submit": bool(PER_SESSION_EXCLUSIVE_SUBMIT),
+                     "prompt_explicit_attachments_v1": PROMPT_EXPLICIT_ATTACHMENTS_V1})
 
 
 @method("client.capabilities")

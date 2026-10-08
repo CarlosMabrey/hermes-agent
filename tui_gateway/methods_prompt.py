@@ -604,7 +604,7 @@ def _persist_session_row_for_submit(rid, session, text=None, display_kind=None):
 
 
 def _run_after_agent_ready(
-    rid, sid, session, text, display_kind, display_metadata, hosted_terminal_callback, turn_author=None
+    rid, sid, session, text, display_kind, display_metadata, hosted_terminal_callback, turn_author=None, image_paths=None, attachment_bundle=None
 ):
     """Turn thread body: patient wait for a deferred build (a slow build must not eat the
     accepted in-flight message), then run."""
@@ -613,6 +613,8 @@ def _run_after_agent_ready(
     # expires. See #63078.
     err = _wait_agent_for_prompt(session, rid, sid)
     if err:
+        if attachment_bundle is not None:
+            attachment_bundle.cleanup()
         # Terminal frame + retained snapshot (not a bare "error" event): the snapshot is
         # the only way resume shows this to a disconnected client.
         _emit_terminal_turn_error(
@@ -624,18 +626,24 @@ def _run_after_agent_ready(
         _emit("session.info", sid, _session_info(session.get("agent"), session))
         return
     with session["history_lock"]:
-        if session.get("_turn_cancel_requested") or not session.get("running"):
+        cancelled = bool(session.get("_turn_cancel_requested"))
+        unrun = cancelled or not session.get("running")
+        if unrun:
             session["running"] = False
             _clear_inflight_turn(session)
-            # Without this emit the turn vanishes silently after {"status": "streaming"}.
-            _emit("error", sid, {"message": (
-                "Turn cancelled before the agent was ready"
-                if session.get("_turn_cancel_requested")
-                else "Session no longer running before the agent was ready")})
-            return
-    _run_prompt_submit(
+    if unrun:
+        if attachment_bundle is not None:
+            attachment_bundle.cleanup()
+        # Without this emit the turn vanishes silently after {"status": "streaming"}.
+        _emit("error", sid, {"message": (
+            "Turn cancelled before the agent was ready" if cancelled
+            else "Session no longer running before the agent was ready")})
+        return
+    started = _run_prompt_submit(
         rid, sid, session, text, display_kind=display_kind, display_metadata=display_metadata,
-        terminal_callback=hosted_terminal_callback, turn_author=turn_author)
+        terminal_callback=hosted_terminal_callback, turn_author=turn_author, image_paths=image_paths)
+    if started is False and attachment_bundle is not None:
+        attachment_bundle.cleanup()
 
 
 _TRUNCATION_PARAMS = (
@@ -643,13 +651,15 @@ _TRUNCATION_PARAMS = (
 
 
 def _lock_in_submit_turn(
-    rid, sid, session, text, params, has_truncation, requested_rebind_ids, hosted_task, display_kind):
+    rid, sid, session, text, params, has_truncation, requested_rebind_ids, hosted_task, display_kind, claim_images=None):
     """Under ``history_lock``: refuse watch-child races / malformed truncation, apply the
     cut, mark the turn running + in flight.  Returns ``(err, survivor_fields)``."""
     fields = {}
     with _session_turn_admission(session) as admitted:
         if not admitted:
             return _err(rid, 5035, "backend is retiring; reconnect to continue"), fields
+        if session.get("running"):
+            return _err(rid, 4092, "prompt admission raced with another turn"), fields
         # A watch session's run lives in the PARENT turn (own running flag False); typing
         # mid-run would build a second agent racing the child on the same stored session.
         if session.get("lazy") and _child_run_active(
@@ -665,6 +675,9 @@ def _lock_in_submit_turn(
                 rid, sid, session, params, requested_rebind_ids)
             if err is not None:
                 return err, {}
+        if claim_images is not None:
+            claim_images.extend(session.get("attached_images", []))
+            session["attached_images"] = []
         session["running"] = True
         session["_turn_cancel_requested"] = False
         session["last_active"] = time.time()
@@ -680,6 +693,42 @@ _CLIENT_SURFACES = frozenset({"hud", "voice-live"})
 
 @method("prompt.submit")
 def _(rid, params: dict) -> dict:
+    from tui_gateway.explicit_attachments import stage
+    mode = params.get("attachment_mode", "legacy")
+    if mode not in ("legacy", "explicit"):
+        return _err(rid, 4000, "invalid attachment_mode")
+    if mode == "legacy":
+        attachments = params.get("attachments", [])
+        if not isinstance(attachments, list) or attachments:
+            return _err(rid, 4000, "attachments require attachment_mode explicit")
+        return _submit_prompt_with_attachments(rid, params)
+    session, err = _sess_nowait(params, rid)
+    if err:
+        return err
+    if params.get("profile") and not _live_profile_matches(session, _profile_home(params["profile"])):
+        return _err(rid, 4000, "profile does not own this session")
+    try:
+        from tui_gateway.contracts.prompt_voice import PromptAttachment
+        attachments = params.get("attachments", [])
+        if not isinstance(attachments, list) or len(attachments) > 4:
+            raise ValueError("invalid attachments list")
+        attachments = [PromptAttachment.model_validate(item).model_dump() for item in attachments]
+        bundle = stage({**session, "profile_home": str(session.get("profile_home") or _hermes_home)}, attachments)
+    except ValueError:
+        return _err(rid, 4000, "invalid explicit attachments")
+    except OSError:
+        return _err(rid, 5027, "explicit attachment staging failed")
+    accepted = False
+    try:
+        response = _submit_prompt_with_attachments(rid, params, list(bundle.paths) if bundle else None, bundle)
+        accepted = "error" not in response and (response.get("result") or {}).get("status") in ("streaming", "queued", "steered", "redirected")
+        return response
+    finally:
+        if bundle is not None and not accepted:
+            bundle.cleanup()
+
+
+def _submit_prompt_with_attachments(rid, params: dict, image_paths=None, attachment_bundle=None) -> dict:
     from hermes_cli.input_sanitize import sanitize_user_prompt_text
     sid = params.get("session_id", "")
     raw_text = params.get("text", "")
@@ -752,33 +801,41 @@ def _(rid, params: dict) -> dict:
     # finished between the two acquisitions, retry the claim rather than strand this
     # prompt in a queue whose drain already ran.
     while True:
-        with session["history_lock"]:
-            if not session.get("running"):
-                break
-            if internal_hosted_submit:
-                return _err(rid, 4091, "hosted room member session is busy")
-            busy_transport = t or session.get("transport")
-        if has_truncation:
-            # A rewind/edit/restore/regenerate must land as a truncation, never as a
-            # steered correction or a plain follow-up queued to run after the live
-            # turn — either would silently drop the history cut the user asked for.
-            # Signal busy so the caller's own interrupt-then-retry loop (already
-            # built for exactly this race — see desktop's `runRewindSubmit`) waits
-            # for `running` to clear and resubmits with the truncation intact.
-            return _err(rid, 4009, "session busy")
-        busy_response = _handle_busy_submit(
-            rid, sid, session, text, busy_transport, queued=bool(params.get("queued")), turn_author=turn_author,
-            display_kind=display_kind)
-        if busy_response is not None:
-            return busy_response
-    raw_rebind_ids = params.get("rebind_survivor_row_ids")
-    requested_rebind_ids = (
-        {r for r in raw_rebind_ids if isinstance(r, int) and not isinstance(r, bool)}
-        if isinstance(raw_rebind_ids, list) else None)
-    err, survivor_fields = _lock_in_submit_turn(
-        rid, sid, session, text, params, has_truncation, requested_rebind_ids, hosted_task, display_kind)
-    if err is not None:
-        return err
+        while True:
+            with session["history_lock"]:
+                if not session.get("running"):
+                    break
+                if internal_hosted_submit:
+                    return _err(rid, 4091, "hosted room member session is busy")
+                busy_transport = t or session.get("transport")
+            if has_truncation:
+                # A rewind/edit/restore/regenerate must land as a truncation, never as a
+                # steered correction or a plain follow-up queued to run after the live
+                # turn — either would silently drop the history cut the user asked for.
+                # Signal busy so the caller's own interrupt-then-retry loop (already
+                # built for exactly this race — see desktop's `runRewindSubmit`) waits
+                # for `running` to clear and resubmits with the truncation intact.
+                return _err(rid, 4009, "session busy")
+            busy_response = _handle_busy_submit(
+                rid, sid, session, text, busy_transport, queued=bool(params.get("queued")), turn_author=turn_author,
+                display_kind=display_kind, image_paths=image_paths, attachment_bundle=attachment_bundle)
+            if busy_response is not None:
+                return busy_response
+        raw_rebind_ids = params.get("rebind_survivor_row_ids")
+        requested_rebind_ids = (
+            {r for r in raw_rebind_ids if isinstance(r, int) and not isinstance(r, bool)}
+            if isinstance(raw_rebind_ids, list) else None)
+        legacy_images = [] if image_paths is None else None
+        err, survivor_fields = _lock_in_submit_turn(
+            rid, sid, session, text, params, has_truncation, requested_rebind_ids, hosted_task, display_kind,
+            claim_images=legacy_images)
+        if err is not None:
+            if (err.get("error") or {}).get("code") == 4092:
+                continue
+            return err
+        break
+    if legacy_images is not None:
+        image_paths = legacy_images
     if turn_isolation:
         if turn_author:
             logger.debug("isolated compute turns carry no author yet; the turn from %s runs unattributed",
@@ -797,7 +854,7 @@ def _(rid, params: dict) -> dict:
             logger.debug("finalized-session reopen before isolated dispatch failed for %s",
                          sid, exc_info=True)
         isolated_response = _submit_prompt_to_compute_host(
-            rid, sid, session, text, display_kind=display_kind, display_metadata=display_metadata)
+            rid, sid, session, text, image_paths=image_paths, display_kind=display_kind, display_metadata=display_metadata)
         if not isolated_response.get("error"):
             # The truncation already happened inline above (memory + DB).
             isolated_response["result"].update(survivor_fields)
@@ -814,6 +871,9 @@ def _(rid, params: dict) -> dict:
             "compute-host dispatch failed for session %s; falling back inline: %s", sid,
             isolated_response["error"].get("message", "unknown error"))
     if (err := _persist_session_row_for_submit(rid, session, text, display_kind)) is not None:
+        if legacy_images is not None:
+            with session["history_lock"]:
+                session["attached_images"] = legacy_images + list(session.get("attached_images", []))
         return err
     # Capture before starting the worker: it consumes the staging dict and may finish before the RPC returns.
     staged_user = session.get("_submit_user_row") or {}
@@ -824,7 +884,8 @@ def _(rid, params: dict) -> dict:
         _start_agent_build(sid, session)
     run_thread = threading.Thread(
         target=lambda: _run_after_agent_ready(
-            rid, sid, session, text, display_kind, display_metadata, hosted_terminal_callback, turn_author),
+            rid, sid, session, text, display_kind, display_metadata, hosted_terminal_callback, turn_author,
+            image_paths, attachment_bundle),
         daemon=True)
     # Handle lets session.interrupt tell a live turn from a stuck `running` flag.
     session["_run_thread"] = run_thread
